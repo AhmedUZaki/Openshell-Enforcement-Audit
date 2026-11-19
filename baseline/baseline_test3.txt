@@ -1,0 +1,103 @@
+Experiment: same request, measured BEFORE and AFTER adding a network allow
+rule. Both stages ran in ONE disposable sandbox, the same running container
+throughout: the rule was added to that sandbox's live policy in place
+(`openshell policy update ... --wait`), with no restart or recreation in
+between. Run live against a real OpenShell gateway/sandbox on 2026-11-19
+(no agent involved, same as baseline_test1/2); the sandbox was created
+through the app's own createSandbox() code path. Not a simulation -- every
+value below is a REAL observed result, never a predicted/expected one
+filled in by hand.
+
+OpenShell version: 0.0.116
+Sandbox: 'oea-net-exp', created fresh for this run from the 'restricted'
+tier (filesystem baseline only, deny-by-default network -- see
+policies/restricted.yaml), deleted again at the end of the run.
+Setup before Stage 1 (not part of what was measured): curl installed into
+the container as root via `docker exec -u root ... apt-get install curl`,
+which runs outside the OpenShell supervisor. Both stages then used that
+same /usr/bin/curl.
+
+Held the same in both stages: the sandbox and its container, image, binary
+(/usr/bin/curl), command and arguments, and destination.
+Deliberately changed between stages: only the policy -- version 1 -> 2,
+one rule added (hashes below).
+NOT controlled, and so also different between the stages: about 4 seconds
+of elapsed time, the remote server's and DNS's state at each moment, and
+the sandbox's own history (Stage 2 is the second connection attempt after
+a denied first one). That is why the conclusion below rests on OpenShell's
+own decision log naming the new rule, not on the HTTP result alone.
+
+Command actually run (the EXACT command, including --write-out -- this is
+what "HTTP status" below comes from; there is no separate, undocumented
+step that produced it):
+  curl -s -o /dev/null -w "HTTP_STATUS:%{http_code}\n" -I https://www.cnn.com:443/2010/US/12/06/wikileaks/index.html
+
+Policy identity is read from `openshell policy get oea-net-exp -o json --full`
+for EACH stage (its top-level `active_version`/`hash` fields, not just a
+byte-length check) -- this is what actually confirms the policy differs
+between the two measurements, not merely implied by it.
+
+----------------------------------------------------------------------
+STAGE 1 -- BEFORE adding the allow rule
+----------------------------------------------------------------------
+Active policy: version 1, hash
+41ca5e7c0a58a376e2f8ac8037b218fcf5d2ac064eee31463d2508902f541043 (no
+network_policies entries yet -- deny-by-default).
+
+curl exit code: 56 (CONNECT tunnel failed)
+Output of the command above: HTTP_STATUS:000 -- the TCP/TLS connection
+itself was refused before an HTTP response could happen.
+
+OpenShell decision log (--source default, i.e. sandbox-side OCSF log):
+[REDACTED-TS] [sandbox] [OCSF] NET:OPEN [MED] DENIED /usr/bin/curl([REDACTED-PID]) -> www.cnn.com:443 [policy:- engine:opa] [reason:network connections not allowed by policy]
+
+----------------------------------------------------------------------
+Rule added between stages:
+----------------------------------------------------------------------
+  openshell policy update oea-net-exp \
+    --rule-name oea-net-exp-cnn \
+    --binary /usr/bin/curl \
+    --add-endpoint www.cnn.com:443:read-only:rest:enforce \
+    --wait
+
+Result: policy version 2 submitted and loaded (active version: 2), hash
+4b9fc86896e5348f344ea480053f07bde40ae2116d5fe410c6d0feb98bafc188 -- this
+is the SAME hash independently re-read from `openshell policy get` in
+Stage 2 below, confirming it's the version actually active when the
+second request ran, not just the version the update command reported
+submitting.
+
+----------------------------------------------------------------------
+STAGE 2 -- AFTER adding the allow rule
+----------------------------------------------------------------------
+Active policy: version 2, hash
+4b9fc86896e5348f344ea480053f07bde40ae2116d5fe410c6d0feb98bafc188 --
+contains the 'oea-net-exp-cnn' rule for www.cnn.com:443.
+
+curl exit code: 0
+Output of the command above: HTTP_STATUS:200
+
+OpenShell decision log:
+[REDACTED-TS] [sandbox] [OCSF] NET:OPEN [INFO] ALLOWED /usr/bin/curl([REDACTED-PID]) -> www.cnn.com:443 [policy:oea-net-exp-cnn engine:opa]
+[REDACTED-TS] [sandbox] [OCSF] HTTP:HEAD [INFO] ALLOWED HEAD http://www.cnn.com:443/2010/US/12/06/wikileaks/index.html [policy:oea-net-exp-cnn engine:l7]
+
+----------------------------------------------------------------------
+Comparison
+----------------------------------------------------------------------
+| stage  | policy rule for this endpoint | curl exit | HTTP status | OpenShell decision + rule           |
+|--------|--------------------------------|-----------|-------------|--------------------------------------|
+| before | none                            | 56        | (none)      | DENIED, policy:- (no matching rule)  |
+| after  | oea-net-exp-cnn (read-only)     | 0         | 200         | ALLOWED, policy:oea-net-exp-cnn      |
+
+The HTTP status difference (none vs 200) alone is not what's being used as
+evidence here -- OpenShell's own per-request decision log line is what
+directly attributes the change to the specific rule just added (naming it
+by name, 'policy:oea-net-exp-cnn', not just "some rule now matches"); the
+curl exit code and HTTP status are corroborating, not the proof.
+
+Not yet covered by this experiment (left for a future run, not filled in
+as an assumed result): what happens to a REQUEST METHOD other than HEAD
+against the same rule (the rule was added as access=read-only, which may
+treat GET/POST differently at the L7 layer), and whether removing the
+rule afterward restores the exact BEFORE state (not run here -- the
+sandbox was deleted instead of having the rule removed and re-tested).

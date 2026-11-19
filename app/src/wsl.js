@@ -19,33 +19,212 @@ function toWslTmpPath(winPath) {
 const commandEvents = new EventEmitter();
 let nextCommandId = 1;
 
-// Best-effort scrub of anything that looks like a credential, so the live
-// log never shows one even if a command happened to carry one -- this is
-// pattern-matching, not a guarantee, so it only ever widens what gets
-// redacted, never narrows it.
-function scrubCredentials(text) {
-  return (
-    String(text)
+// The ONE rule for whether a field name is credential-like, used by every
+// redaction path: parsed JSON (below), free-form text (scrubKeyedValues),
+// and the policy display in runner.js. Two separate rules used to drift
+// apart -- the text path only knew bare words like "secret", so
+// `"secret_key": "..."` in a partial or prefixed JSON document went
+// through untouched, and the JSON path's `_`-only separators missed
+// `x-api-key`. The name is compared with case and separators removed, and
+// the word may appear anywhere in it (`access_token`, `clientSecret`,
+// `x-api-key`, `secret_key`). That also hides harmless names such as
+// "tokenizer" -- an accepted trade: this only ever over-redacts.
+const CREDENTIAL_NAME_WORDS = /authorization|apikey|token|secret|password|passwd/;
+
+function isCredentialKey(name) {
+  return CREDENTIAL_NAME_WORDS.test(String(name).toLowerCase().replace(/[^a-z0-9]/g, ""));
+}
+
+// Deep-clones a JSON-shaped value, replacing the VALUE of any object key
+// whose name looks credential-like with a fixed marker -- never touching
+// the surrounding structure, so the result is always still valid JSON
+// (unlike a text-level regex scrub, which can't tell a JSON value's own
+// quotes/commas from the string's punctuation). `mapString`, when given,
+// is applied to every other string leaf.
+function redactCredentialFields(value, mapString) {
+  if (Array.isArray(value)) return value.map((v) => redactCredentialFields(v, mapString));
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = isCredentialKey(k) ? "[REDACTED]" : redactCredentialFields(v, mapString);
+    }
+    return out;
+  }
+  if (typeof value === "string" && mapString) return mapString(value);
+  return value;
+}
+
+// Where a value that starts at `i` ends. Anything that never closes -- a
+// chunk that is still streaming in, or truncated output -- runs to the end
+// of its line (quoted) or of the whole text (a `{`/`[` structure), so what
+// has arrived so far is hidden rather than shown up to its first space.
+function endOfValue(s, i) {
+  const escaped = /^(\\+)"/.exec(s.slice(i, i + 64));
+  if (escaped) {
+    // Value in ESCAPED quotes -- JSON encoded inside another string, at
+    // any depth (`\"`, `\\\"`, ...). It ends at the next delimiter of the
+    // same depth, but only if nothing between contains a backslash: one
+    // there means a deeper escape (e.g. an escaped quote inside the
+    // value), and the true end can't be placed with confidence -- so the
+    // rest of the line is hidden instead of guessing and leaking a tail.
+    const delim = escaped[1] + '"';
+    const nl = s.indexOf("\n", i);
+    const lineEnd = nl >= 0 ? nl : s.length;
+    const close = s.indexOf(delim, i + delim.length);
+    if (close >= 0 && close < lineEnd && !s.slice(i + delim.length, close).includes("\\")) return close + delim.length;
+    return lineEnd;
+  }
+  const c = s[i];
+  if (c === '"' || c === "'") {
+    for (let j = i + 1; j < s.length; j++) {
+      if (s[j] === "\\") j++;
+      else if (s[j] === c) return j + 1;
+      else if (s[j] === "\n") return j;
+    }
+    return s.length;
+  }
+  if (c === "{" || c === "[") {
+    let depth = 0;
+    let inString = false;
+    for (let j = i; j < s.length; j++) {
+      const ch = s[j];
+      if (inString) {
+        if (ch === "\\") j++;
+        else if (ch === '"') inString = false;
+      } else if (ch === '"') inString = true;
+      else if (ch === "{" || ch === "[") depth++;
+      else if (ch === "}" || ch === "]") {
+        depth--;
+        if (depth === 0) return j + 1;
+      }
+    }
+    return s.length;
+  }
+  const m = /^\S+/.exec(s.slice(i));
+  return i + (m ? m[0].length : 0);
+}
+
+// `name: value` / `name=value` pairs in free-form text, with the name
+// optionally quoted (`"name"`, `'name'`, or escaped `\"name\"`). Every
+// pair is found; whether it gets redacted is decided by isCredentialKey(),
+// the same rule the parsed-JSON path uses.
+const KEY_RE = /(\\*["']?)([A-Za-z0-9_.-]+)\1?\s*[:=]\s*/g;
+
+function scrubKeyedValues(s) {
+  let out = "";
+  let pos = 0;
+  KEY_RE.lastIndex = 0;
+  let m;
+  while ((m = KEY_RE.exec(s))) {
+    if (!isCredentialKey(m[2])) {
+      // Step past the name only, not its value: a credential can sit
+      // inside a harmless field's value (`note="token=..."`).
+      KEY_RE.lastIndex = m.index + m[1].length + m[2].length;
+      continue;
+    }
+    const valueEnd = endOfValue(s, m.index + m[0].length);
+    out += s.slice(pos, m.index) + m[2] + "=[REDACTED]";
+    pos = valueEnd;
+    KEY_RE.lastIndex = Math.max(valueEnd, m.index + m[0].length);
+  }
+  return out + s.slice(pos);
+}
+
+// A complete JSON string literal whose content is itself encoded text
+// (it contains `\"`) -- typically a log line carrying a JSON document as a
+// string. Decoded, scrubbed as a whole (so a nested JSON document gets
+// the exact structural redaction, at any depth), and re-encoded. Only
+// literals that decode cleanly and actually change are replaced.
+const STRING_LITERAL = /"(?:[^"\\\n]|\\.)*"/g;
+const MAX_NESTING = 6;
+
+function scrubInsideStringLiterals(s, depth) {
+  if (depth >= MAX_NESTING) return s;
+  return s.replace(STRING_LITERAL, (lit) => {
+    if (!lit.includes('\\"')) return lit;
+    let decoded;
+    try {
+      decoded = JSON.parse(lit);
+    } catch {
+      return lit;
+    }
+    if (typeof decoded !== "string") return lit;
+    const scrubbed = scrubAtDepth(decoded, depth + 1);
+    return scrubbed === decoded ? lit : JSON.stringify(scrubbed);
+  });
+}
+
+function scrubText(text, depth = 0) {
+  const s = String(text)
       // "Bearer <token>" is space-separated, not key:value -- the actual
       // secret is the word AFTER "Bearer", which the generic pattern below
       // would miss entirely (it would redact only the literal word
       // "Bearer", leaving the real token in plain sight).
       .replace(/\bbearer\s+\S+/gi, "Bearer [REDACTED]")
-      // Optional quote BEFORE the keyword (a JSON key: `"password"`), and
-      // the VALUE matched as a whole quoted string first (greedy up to the
-      // next matching quote) before falling back to a bare \S+ token --
-      // without that quoted-string alternative, a value containing a
-      // comma/space/brace of its own (`"token": "abc,def"`) only matched
-      // up to the first such character, leaving the rest of the real
-      // secret sitting in plain text right after "[REDACTED]". This is
-      // the same hazard getActivePolicy()'s redactCredentialFields() was
-      // written to avoid for the policy JSON display; command stdout/stderr
-      // shown in the Command activity log goes through this function
-      // instead (free-form text, not a parsed object), so it needs the
-      // same quoted-value awareness to redact as completely.
-      .replace(/"?(authorization|api[_-]?key|token|secret|password)"?\s*[:=]\s*("[^"]*"|'[^']*'|\S+)/gi, "$1=[REDACTED]")
-      .replace(/\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g, "[REDACTED_JWT]")
-  );
+      // CONFIRMED real bug: an "Authorization: <scheme> <value>" HTTP
+      // header (e.g. "Authorization: Basic DUMMY_TOKEN") is SPACE-
+      // separated, not a single token -- the generic key=value pattern
+      // below only ever captures up to the first whitespace (its \S+
+      // fallback), so it redacted just the word "Basic" and left the
+      // actual credential value sitting in plain text right after
+      // "[REDACTED]". Directly confirmed: scrubCredentials("Authorization:
+      // Basic DUMMY_TOKEN") returned "Authorization=[REDACTED] DUMMY_TOKEN".
+      // Must run BEFORE the keyed-value pass below, which would otherwise
+      // take only "Basic" as the value. Redacts to the END OF THE LINE,
+      // not just the next token -- this also safely over-redacts a
+      // compact one-line JSON blob that happens to embed this same key,
+      // which is fine (widening, never narrowing what gets hidden).
+      .replace(/\bauthorization\s*:\s*\S[^\r\n]*/gi, "Authorization: [REDACTED]");
+  return scrubKeyedValues(scrubInsideStringLiterals(s, depth)).replace(/\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g, "[REDACTED_JWT]");
+}
+
+// For the live Command activity view while a command is still running.
+// A JSON structure that has started arriving but not finished can't be
+// redacted by structure yet, so everything from its first `{`/`[` is held
+// back until the command finishes and the complete output can be scrubbed
+// as a whole (scrubCredentials). Text before it is shown, scrubbed.
+function scrubPartialOutput(text) {
+  const s = String(text ?? "");
+  const i = s.search(/[{[]/);
+  if (i < 0) return scrubCredentials(s);
+  return scrubCredentials(s.slice(0, i)) + "[structured output still arriving -- shown once the command finishes]";
+}
+
+// Best-effort scrub of anything that looks like a credential, used for
+// the Command activity log and for every command output this app stores
+// or returns. Output that is a complete JSON document is redacted by KEY
+// NAME on the parsed value (the only way to be exact about where a value
+// ends, whatever quotes or escapes it contains), with the text scrub
+// applied to each remaining string inside it. Anything else -- JSON after
+// a log prefix, or a truncated document -- goes through the text scrub,
+// which finds every `name: value` pair and applies the same name rule.
+// (While a command is still running, the live view uses
+// scrubPartialOutput() instead.) Pattern-matching, not a guarantee, so it
+// only ever widens what gets redacted, never narrows it.
+function scrubCredentials(text) {
+  return scrubAtDepth(text, 0);
+}
+
+// `depth` counts how many layers of encoding we are inside (a JSON string
+// holding JSON holding ...), so decoding can't recurse without bound.
+function scrubAtDepth(text, depth) {
+  const s = String(text ?? "");
+  const trimmed = s.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      parsed = undefined;
+    }
+    if (parsed !== undefined && typeof parsed === "object" && parsed !== null) {
+      // A string value inside the document may itself carry encoded JSON
+      // or `key=value` text, so every remaining string is scrubbed too.
+      const mapString = (v) => (depth + 1 >= MAX_NESTING ? scrubText(v, depth + 1) : scrubAtDepth(v, depth + 1));
+      return JSON.stringify(redactCredentialFields(parsed, mapString), null, 2) + (s.endsWith("\n") ? "\n" : "");
+    }
+  }
+  return scrubText(s, depth);
 }
 
 // IMPORTANT, confirmed experimentally: passing the command as a `bash -lc
@@ -88,7 +267,7 @@ function runInWsl(command, { timeoutMs = 60_000, redactOutput = false, redactStd
         return "[could not safely render this command's output for the log]";
       }
     }
-    return scrubCredentials(stdout);
+    return complete ? scrubCredentials(stdout) : scrubPartialOutput(stdout);
   }
 
   // Every exit from this function, including a setup failure before a
@@ -163,7 +342,7 @@ function runInWsl(command, { timeoutMs = 60_000, redactOutput = false, redactStd
       commandEvents.emit("update", {
         id,
         stdout: renderStdoutForLog(stdout, { complete: false }),
-        stderr: scrubCredentials(stderr),
+        stderr: scrubPartialOutput(stderr),
       });
     };
 
@@ -188,4 +367,4 @@ function runInWsl(command, { timeoutMs = 60_000, redactOutput = false, redactStd
   });
 }
 
-module.exports = { runInWsl, commandEvents, scrubCredentials };
+module.exports = { runInWsl, commandEvents, scrubCredentials, scrubPartialOutput, redactCredentialFields, isCredentialKey };

@@ -426,7 +426,6 @@ function createTreeController(containerEl, { onSelect } = {}) {
   async function toggleExpand(nodePath) {
     const node = nodesByPath.get(nodePath);
     if (!node || !node.canList) return;
-    const isOpen = node.childrenEl.style.display !== "none" && node.loaded;
     if (node.loaded) {
       const nowHidden = node.childrenEl.style.display !== "none";
       node.childrenEl.style.display = nowHidden ? "none" : "block";
@@ -445,15 +444,14 @@ function createTreeController(containerEl, { onSelect } = {}) {
     const res = await window.audit.listDirectory(sandboxAtCall, nodePath);
     if (myGeneration !== treeGeneration) return; // a newer loadRoot()/clear() happened while this was in flight
     node.loaded = true;
-    if (!res.canList) {
-      const msg = document.createElement("div");
-      msg.className = "tree-reason";
-      msg.style.paddingLeft = `${depth * 14 + 18}px`;
-      msg.textContent = `(could not be listed: ${res.reason})`;
-      node.childrenEl.appendChild(msg);
+    if (!res.ok || !res.canList) {
+      node.canList = false;
+      node.toggleEl.textContent = " ";
+      node.reasonEl.textContent = ` (could not be listed: ${res.ok ? res.reason : res.error})`;
       return;
     }
     if (res.children.length === 0) {
+      node.toggleEl.textContent = " ";
       const msg = document.createElement("div");
       msg.className = "tree-reason";
       msg.style.paddingLeft = `${depth * 14 + 18}px`;
@@ -478,23 +476,14 @@ function createTreeController(containerEl, { onSelect } = {}) {
     wrapper.appendChild(childrenEl);
     parentEl.appendChild(wrapper);
 
+    // Nothing is fetched when a row is drawn: a folder is listed only when
+    // it is expanded (loadChildren), and that result stays in the DOM for
+    // collapsing/re-expanding. Drawing a folder with 100 subfolders used to
+    // fire one listing per row -- ~200 WSL/docker commands -- before the
+    // user had opened any of them. A folder that can't be listed now shows
+    // why when it's expanded, rather than up front.
     const node = { rowEl: row, toggleEl: toggle, reasonEl: reasonSpan, childrenEl, loaded: false, canList: true, depth };
     nodesByPath.set(nodePath, node);
-
-    // Peek at listability without fully expanding, so a folder that can't
-    // be listed shows that reason immediately instead of only on click.
-    const myGeneration = treeGeneration;
-    window.audit.listDirectory(sandboxName, nodePath).then((res) => {
-      if (myGeneration !== treeGeneration) return; // a newer loadRoot()/clear() happened while this was in flight
-      node.canList = res.canList;
-      if (!res.canList) {
-        toggle.textContent = " ";
-        reasonSpan.textContent = ` (${res.reason})`;
-      } else if (res.children.length === 0) {
-        toggle.textContent = " ";
-      }
-    });
-
     return node;
   }
 
@@ -674,13 +663,22 @@ document.getElementById("folderCreateBtn").addEventListener("click", async () =>
   // matches again.
   const selectionAtStart = selectionGeneration;
 
-  dialogStatus.textContent = "Creating...";
-  const res = await window.audit.createProtectedFolder({ sandboxName, folderName, permission });
+  // One request at a time from this window (the main process also refuses
+  // a second recreate of the same sandbox, whichever window it comes from).
+  const createBtn = document.getElementById("folderCreateBtn");
+  createBtn.disabled = true;
+  dialogStatus.textContent = "Creating... (the sandbox is deleted and recreated; this can take a few minutes)";
+  let res;
+  try {
+    res = await window.audit.createProtectedFolder({ sandboxName, folderName, permission });
+  } finally {
+    createBtn.disabled = false;
+  }
   if (!res.ok) {
-    dialogStatus.textContent = "Error: " + (res.error || res.output);
+    dialogStatus.textContent = "Error: " + res.error;
     return;
   }
-  status.textContent = `Created ${res.folderPath} in '${sandboxName}' -- Linux: ${res.linuxMode}; OpenShell permission: ${permission}.`;
+  status.textContent = `Created ${res.folderPath} in '${sandboxName}' -- Linux: ${res.linuxMode}; OpenShell permission: ${res.actualPermission || permission} (verified against the sandbox's actual policy).`;
   folderDialog.close();
 
   // Folder creation recreates the whole sandbox, which can take minutes --
