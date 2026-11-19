@@ -1,0 +1,17 @@
+Policy added:
+NONE
+
+shell command:
+curl -I https://www.cnn.com/2010/US/12/06/wikileaks/index.html
+
+Information:
+sandbox@aa64fcb303cd:/$ curl -I https://www.cnn.com:443/2010/US/12/06/wikileaks/index.html
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+Content-Length: 149
+Connection: close
+
+curl: (56) CONNECT tunnel failed, response 403
+
+OpenShell Logs: 
+[1795057695.307] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(46784) -> www.cnn.com:443 [policy:- engine:opa] [reason:endpoint www.cnn.com:443 is not allowed by any policy]

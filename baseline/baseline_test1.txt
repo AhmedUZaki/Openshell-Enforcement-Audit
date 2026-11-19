@@ -1,0 +1,44 @@
+Policy added:
+openshell policy update demo \
+  --rule-name wikipedia \
+  --binary /usr/bin/curl \
+  --add-endpoint en.wikipedia.org:443:read-only:rest:enforce \
+  --wait
+
+shell command
+curl -I https://en.wikipedia.org:443/wiki/bee 
+
+Information:
+
+HTTP/1.1 200 Connection Established
+HTTP/1.1 301 Moved Permanently
+date: Thu, 19 Nov 2026 02:20:19 GMT
+server: mw-web.eqiad.main-dcb7d5775-q9lvc
+x-content-type-options: nosniff
+last-modified: Thu, 19 Nov 2026 02:20:19 GMT
+location: https://en.wikipedia.org/wiki/Bee
+content-length: 0
+content-type: text/html; charset=UTF-8
+age: 976
+x-cache: cp1114 miss, cp1114 hit/4
+x-cache-status: hit-front
+strict-transport-security: max-age=106384710; includeSubDomains; preload
+report-to: { "group": "wm_nel", "max_age": 604800, "endpoints": [{ "url": "https://intake-logging.wikimedia.org/v1/events?stream=w3c.reportingapi.network_error&schema_uri=/w3c/reportingapi/network_error/1.0.0" }] }
+nel: { "report_to": "wm_nel", "max_age": 604800, "failure_fraction": 0.05, "success_fraction": 0.0}
+set-cookie: WMF-Last-Access=19-Nov-2026;Path=/;HttpOnly;secure;Expires=Mon, 21 Dec 2026 00:00:00 GMT
+set-cookie: WMF-Last-Access-Global=19-Nov-2026;Path=/;Domain=.wikipedia.org;HttpOnly;secure;Expires=Mon, 21 Dec 2026 00:00:00 GMT
+x-client-ip: 192.186.116.210
+cache-control: private, s-maxage=0, max-age=0, must-revalidate, no-transform
+vary: Accept-Encoding,X-Forwarded-Proto,Cookie,Authorization,User-Agent
+set-cookie: GeoIP=CA:ON:Oakville:43.44:-79.76:v4; Path=/; secure; Domain=.wikipedia.org
+set-cookie: NetworkProbeLimit=0.001;Path=/;Secure;SameSite=None;Max-Age=3600
+set-cookie: WMF-Uniq=uq2aeJT9X3nhdfEMcgdL6QQdAAAAAFvdON9NlBOhdxX2IaN7woRerHGRrunSDWZr;Domain=.wikipedia.org;Path=/;HttpOnly;secure;SameSite=None;Expires=Fri, 19 Nov 2027 00:00:00 GMT
+x-request-id: 3b7fe176-27ad-48da-9d7b-2c65ff50e597
+x-analytics: 
+server-timing: cache;desc="hit-front", host;desc="cp1114",co_id;desc="3655761928"
+
+
+OpenShell Logs:
+[1795057618.167] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(46145) -> en.wikipedia.org:443 [policy:wikipedia engine:opa]
+[1795057618.217] [sandbox] [OCSF ] [ocsf] HTTP:HEAD [INFO] ALLOWED HEAD http://en.wikipedia.org:443/wiki/bee [policy:wikipedia engine:l7]
+
