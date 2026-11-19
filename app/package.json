@@ -1,0 +1,13 @@
+{
+  "name": "openshell-enforcement-audit-gui",
+  "version": "0.1.0",
+  "description": "Desktop GUI for running and comparing direct, no-agent OpenShell enforcement tests across versions",
+  "main": "src/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}

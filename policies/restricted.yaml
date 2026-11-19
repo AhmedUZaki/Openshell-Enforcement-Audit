@@ -1,0 +1,26 @@
+# Native OpenShell policy (not a NemoClaw preset) for the Restricted tier:
+# the shared filesystem baseline, deny-by-default network (no extra presets).
+# Schema confirmed against a real `openshell sandbox get -o yaml` / policy
+# dump on this host; trimmed of agent-specific bits (no OpenClaw binaries/
+# managed_inference) since this project runs no agent.
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /dev/urandom
+    - /etc
+    - /var/log
+    - /var/lib/dpkg
+  read_write:
+    - /tmp
+    - /dev/null
+    - /dev/pts
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+# No network_policies entries: everything is denied by default, matching the
+# report's "Restricted: No tier defaults" (Table 2).
