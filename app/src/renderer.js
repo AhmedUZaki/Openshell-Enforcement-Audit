@@ -107,6 +107,7 @@ const globalSandboxSelect = document.getElementById("globalSandboxName");
 const protectedFolderSection = document.getElementById("protectedFolderSection");
 const treeSection = document.getElementById("treeSection");
 const attemptSection = document.getElementById("attemptSection");
+const networkSection = document.getElementById("networkSection");
 const folderDialogSandboxName = document.getElementById("folderDialogSandboxName");
 
 function applySandboxGatedUI() {
@@ -114,6 +115,7 @@ function applySandboxGatedUI() {
   protectedFolderSection.disabled = !has;
   treeSection.disabled = !has;
   attemptSection.disabled = !has;
+  networkSection.disabled = !has;
   folderDialogSandboxName.textContent = state.sandboxName || "(none)";
 }
 
@@ -152,6 +154,7 @@ async function onSandboxChanged(sandboxName) {
   applySandboxGatedUI();
   updateTargetDisplays();
   loadActivePolicy(sandboxName, { autoOpen: true }); // not awaited: independent of the tree/permission loads below
+  refreshNetworkExpectation(); // not awaited either
   await refreshEffectivePermission(myGeneration);
   if (myGeneration !== selectionGeneration) return; // superseded by a newer switch while awaiting above
   if (sandboxName) {
@@ -230,7 +233,9 @@ function renderPolicySummary(summary) {
       // under it), not to one endpoint specifically -- shown on each of
       // its endpoint rows so it's never implied that only SOME of a
       // group's endpoints are restricted to those binaries.
-      const binariesText = np.binaries && np.binaries.length ? np.binaries.join(", ") : "(any)";
+      // A rule that lists no binaries is NOT "any binary": measured, curl
+      // was refused by such a rule, so it is shown as what it is.
+      const binariesText = np.binaries && np.binaries.length ? np.binaries.join(", ") : "(none listed)";
       for (const ep of np.endpoints) {
         const tr = document.createElement("tr");
         tr.appendChild(td(`${ep.host}:${ep.port} (${ep.protocol})`));
@@ -336,6 +341,7 @@ document.getElementById("refreshPolicyBtn").addEventListener("click", () => {
   // showing whatever permission was true before the policy was last
   // reloaded, even though the user just asked to see the current policy.
   if (state.folderPath) refreshEffectivePermission(++selectionGeneration);
+  refreshNetworkExpectation(); // the network test's expectation comes from this same policy
 });
 
 globalSandboxSelect.addEventListener("change", () => onSandboxChanged(globalSandboxSelect.value));
@@ -745,6 +751,90 @@ runBtn.addEventListener("click", async () => {
     await refreshResults();
   } finally {
     runBtn.disabled = false;
+  }
+});
+
+// =======================================================================
+// Network test: runs under the sandbox's EXISTING policy and never changes
+// it. The expectation shown here comes from the live policy; nothing is
+// sent until "Run network test" is clicked.
+// =======================================================================
+const netUrlEl = document.getElementById("netUrl");
+const netMethodEl = document.getElementById("netMethod");
+const netBodyRow = document.getElementById("netBodyRow");
+const netBodyEl = document.getElementById("netBody");
+const netExpectBadge = document.getElementById("netExpectBadge");
+const netExpectDetail = document.getElementById("netExpectDetail");
+const netRunBtn = document.getElementById("netRunBtn");
+const netStatus = document.getElementById("netStatus");
+const NET_BODY_METHODS = ["POST", "PUT", "PATCH"];
+
+// Bumped on every refresh: a slow reply for an earlier URL/method/sandbox
+// must not overwrite the expectation for what is selected now.
+let netExpectGeneration = 0;
+
+function setNetBadge(cls, text, detail) {
+  netExpectBadge.className = `perm-badge ${cls}`;
+  netExpectBadge.textContent = text;
+  netExpectDetail.textContent = detail;
+}
+
+async function refreshNetworkExpectation() {
+  const myGeneration = ++netExpectGeneration;
+  const sandboxAtCall = state.sandboxName;
+  if (!sandboxAtCall) {
+    setNetBadge("perm-unknown", "Unknown", "Select a sandbox first.");
+    return;
+  }
+  setNetBadge("perm-unknown", "...", "");
+  const res = await window.audit.previewNetworkExpectation({ sandboxName: sandboxAtCall, url: netUrlEl.value.trim(), method: netMethodEl.value });
+  if (myGeneration !== netExpectGeneration || sandboxAtCall !== state.sandboxName) return;
+  if (!res.ok) {
+    setNetBadge("perm-unknown", "Unknown", res.error);
+    return;
+  }
+  const e = res.expected;
+  const policyNote = ` (policy version ${res.policy.version})`;
+  if (e.level === "allow") setNetBadge("net-allow", "Allowed", e.reason + policyNote);
+  else if (e.level === "block_connection") setNetBadge("net-block", "Blocked (connection)", e.reason + policyNote);
+  else if (e.level === "block_request") setNetBadge("net-block", "Blocked (HTTP request)", e.reason + policyNote);
+  else setNetBadge("perm-unknown", "No expectation", e.reason + policyNote);
+}
+
+function syncNetBodyRow() {
+  netBodyRow.style.display = NET_BODY_METHODS.includes(netMethodEl.value) ? "block" : "none";
+}
+netMethodEl.addEventListener("change", () => {
+  syncNetBodyRow();
+  refreshNetworkExpectation();
+});
+netUrlEl.addEventListener("change", refreshNetworkExpectation);
+syncNetBodyRow();
+
+netRunBtn.addEventListener("click", async () => {
+  const sandboxName = state.sandboxName;
+  if (!sandboxName) {
+    netStatus.textContent = "Select a sandbox first.";
+    return;
+  }
+  const url = netUrlEl.value.trim();
+  const method = netMethodEl.value;
+  const body = NET_BODY_METHODS.includes(method) ? netBodyEl.value : undefined;
+  const versionTag = document.getElementById("versionTag").value.trim();
+
+  netRunBtn.disabled = true;
+  netStatus.textContent = "Running...";
+  try {
+    const res = await window.audit.runNetworkTest({ sandboxName, url, method, body, versionTag });
+    if (!res.ok) {
+      netStatus.textContent = "Error: " + res.error;
+      return;
+    }
+    const r = res.result;
+    netStatus.textContent = `[${sandboxName}] ${r.method} ${r.url} -- HTTP status ${r.httpStatus ?? "-"}: ${r.verdict}`;
+    await refreshResults();
+  } finally {
+    netRunBtn.disabled = false;
   }
 });
 

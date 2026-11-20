@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld("audit", {
   listDirectory: (sandboxName, dirPath) => ipcRenderer.invoke("directory:list", { sandboxName, dirPath }),
   computeEffectivePermission: (sandboxName, targetPath) => ipcRenderer.invoke("permission:compute", { sandboxName, targetPath }),
   getActivePolicy: (sandboxName) => ipcRenderer.invoke("policy:get", { sandboxName }),
+  runNetworkTest: (params) => ipcRenderer.invoke("network:run", params),
+  previewNetworkExpectation: (params) => ipcRenderer.invoke("network:expect", params),
 
   // Live command-activity feed: each callback fires once per event, with
   // the running count of listeners managed by the renderer.

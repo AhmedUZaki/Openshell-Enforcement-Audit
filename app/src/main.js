@@ -11,6 +11,8 @@ const {
   listDirectory,
   computeEffectivePermission,
   getActivePolicy,
+  runNetworkTest,
+  previewNetworkExpectation,
 } = require("./runner");
 const { commandEvents } = require("./wsl");
 
@@ -49,7 +51,25 @@ function createWindow() {
   });
 }
 
+// One running copy only. The per-sandbox locks (a test and a delete-and-
+// recreate of the same sandbox must never overlap) live inside this process,
+// so a second copy would bypass them. A second launch just brings the first
+// window to the front.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    const [win] = BrowserWindow.getAllWindows();
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.focus();
+    }
+  });
+}
+
 app.whenReady().then(() => {
+  if (!gotSingleInstanceLock) return;
   ipcMain.handle("sandboxes:list", async () => listSandboxes());
   ipcMain.handle("attempt:run", async (_event, params) => runAttempt(params));
   ipcMain.handle("results:list", async () => listResults());
@@ -60,6 +80,8 @@ app.whenReady().then(() => {
   ipcMain.handle("directory:list", async (_event, { sandboxName, dirPath }) => listDirectory(sandboxName, dirPath));
   ipcMain.handle("permission:compute", async (_event, { sandboxName, targetPath }) => computeEffectivePermission(sandboxName, targetPath));
   ipcMain.handle("policy:get", async (_event, { sandboxName }) => getActivePolicy(sandboxName));
+  ipcMain.handle("network:run", async (_event, params) => runNetworkTest(params));
+  ipcMain.handle("network:expect", async (_event, params) => previewNetworkExpectation(params));
 
   createWindow();
 

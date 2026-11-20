@@ -29,7 +29,7 @@ let nextCommandId = 1;
 // the word may appear anywhere in it (`access_token`, `clientSecret`,
 // `x-api-key`, `secret_key`). That also hides harmless names such as
 // "tokenizer" -- an accepted trade: this only ever over-redacts.
-const CREDENTIAL_NAME_WORDS = /authorization|apikey|token|secret|password|passwd/;
+const CREDENTIAL_NAME_WORDS = /authorization|apikey|token|secret|password|passwd|signature|credential|accesskey|privatekey|passphrase/;
 
 function isCredentialKey(name) {
   return CREDENTIAL_NAME_WORDS.test(String(name).toLowerCase().replace(/[^a-z0-9]/g, ""));
@@ -79,8 +79,10 @@ function endOfValue(s, i) {
     for (let j = i + 1; j < s.length; j++) {
       if (s[j] === "\\") j++;
       else if (s[j] === c) return j + 1;
-      else if (s[j] === "\n") return j;
     }
+    // A quoted value may span lines (a multi-line password or key): it ends
+    // at its closing quote, wherever that is. One that never closes -- still
+    // streaming in, or truncated -- hides everything after it.
     return s.length;
   }
   if (c === "{" || c === "[") {
@@ -175,7 +177,10 @@ function scrubText(text, depth = 0) {
       // compact one-line JSON blob that happens to embed this same key,
       // which is fine (widening, never narrowing what gets hidden).
       .replace(/\bauthorization\s*:\s*\S[^\r\n]*/gi, "Authorization: [REDACTED]");
-  return scrubKeyedValues(scrubInsideStringLiterals(s, depth)).replace(/\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g, "[REDACTED_JWT]");
+  return scrubKeyedValues(scrubInsideStringLiterals(s, depth))
+    // Short query-string names that carry secrets in signed URLs (sig=, key=, ...).
+    .replace(/([?&;])(sig|key|auth|jwt|sas|code)=[^&\s'"#]*/gi, "$1$2=[REDACTED]")
+    .replace(/\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g, "[REDACTED_JWT]");
 }
 
 // For the live Command activity view while a command is still running.

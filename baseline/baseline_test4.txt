@@ -1,0 +1,138 @@
+Experiment: per-endpoint and per-METHOD network enforcement, observed live.
+Three questions, one disposable sandbox:
+  1. An endpoint that IS in the policy: does a GET work?
+  2. An endpoint that is NOT in the policy: can a request get a 200?
+  3. A rule that allows only GET: does OpenShell block a POST to the same
+     endpoint?
+Run on 2026-11-19 against a real OpenShell gateway/sandbox, no agent involved.
+Every value below is a REAL observed result, never a predicted one filled in
+by hand. Recorded with the allow-listed fields from baseline/README.md.
+
+OpenShell version: 0.0.116
+Sandbox: 'oea-net-test', created fresh for this run from the 'restricted' tier
+(deny-by-default network, see policies/restricted.yaml) and deleted at the end.
+All stages ran in that ONE sandbox/container; only the policy was changed
+between stages (versions and hashes below).
+Setup, outside what was measured: curl installed in the container as root with
+`docker exec -u root ... apt-get install curl` (runs outside the OpenShell
+supervisor). Before the sandbox existed, all three requests below returned 200
+from the WSL host with no OpenShell involved, so a block cannot be blamed on a
+site being down.
+
+Command actually run for every request (inside the sandbox, as the sandbox
+user, through OpenShell):
+  openshell sandbox exec -n oea-net-test -- sh -c '
+    code=$(curl -s -m 20 -o /tmp/oea-b -w "%{http_code}" "$@"); rc=$?;
+    echo "HTTP_STATUS:$code CURL_EXIT:$rc";
+    if [ "$code" != 200 ]; then head -c 300 /tmp/oea-b; echo; fi;
+    rm -f /tmp/oea-b' _ <curl arguments shown per request>
+The response body is printed only when the status is not 200. A 200 body from
+httpbin echoes the client's IP address, so it was never captured; a non-200
+body here is OpenShell's own.
+
+The GET-only rule (explicit, not the 'read-only' preset: --dry-run shows that
+preset only as an opaque `access: read-only` flag, so it does not say which
+methods it allows; an explicit rule is literally "GET only"):
+  openshell policy update oea-net-test \
+    --rule-name net-test-get \
+    --binary /usr/bin/curl \
+    --add-endpoint httpbin.org:443::rest:enforce \
+    --add-allow 'httpbin.org:443:GET:/**' \
+    --wait
+which expands to
+  endpoints: host httpbin.org, port 443, protocol rest, enforcement enforce,
+  rules: allow method GET, path /**; binaries: /usr/bin/curl
+
+----------------------------------------------------------------------
+STAGE 0 -- control: no network rule yet
+Active policy: version 1, hash
+41ca5e7c0a58a376e2f8ac8037b218fcf5d2ac064eee31463d2508902f541043
+----------------------------------------------------------------------
+curl -X GET https://httpbin.org/get
+  -> HTTP_STATUS:000 CURL_EXIT:56 (the connection is refused before any HTTP)
+  [REDACTED-TS] [sandbox] [OCSF] NET:OPEN [MED] DENIED /usr/bin/curl([REDACTED-PID]) -> httpbin.org:443 [policy:- engine:opa] [reason:network connections not allowed by policy]
+
+Rule applied: policy version 2 submitted and loaded (hash prefix ada4cbc78316).
+
+----------------------------------------------------------------------
+STAGE 1 -- GET-only rule on httpbin.org:443
+Active policy: version 2, hash
+ada4cbc783163d4a5365cf3249c44b4a32ecbdf41f84e4df1428ed0add33b66f
+----------------------------------------------------------------------
+TEST 1 -- endpoint IN the policy, GET (run twice, identical)
+curl -X GET https://httpbin.org/get
+  -> HTTP_STATUS:200 CURL_EXIT:0
+  [REDACTED-TS] [sandbox] [OCSF] NET:OPEN [INFO] ALLOWED /usr/bin/curl([REDACTED-PID]) -> httpbin.org:443 [policy:net-test-get engine:opa]
+  [REDACTED-TS] [sandbox] [OCSF] HTTP:GET [INFO] ALLOWED GET http://httpbin.org:443/get [policy:net-test-get engine:l7]
+
+TEST 2 -- endpoint NOT in the policy, GET (run twice, identical)
+curl -X GET https://example.com/
+  -> HTTP_STATUS:000 CURL_EXIT:56   NO 200: the connection is refused
+  [REDACTED-TS] [sandbox] [OCSF] NET:OPEN [MED] DENIED /usr/bin/curl([REDACTED-PID]) -> example.com:443 [policy:- engine:opa] [reason:endpoint example.com:443 is not allowed by any policy]
+
+TEST 3a -- GET-only endpoint: GET (contrast), then POST (run twice, identical)
+curl -X GET https://httpbin.org/get
+  -> HTTP_STATUS:200 CURL_EXIT:0
+  [REDACTED-TS] [sandbox] [OCSF] HTTP:GET [INFO] ALLOWED GET http://httpbin.org:443/get [policy:net-test-get engine:l7]
+curl -X POST -d dummy=1 https://httpbin.org/post
+  -> HTTP_STATUS:403 CURL_EXIT:0   the TCP/TLS connection is allowed, the
+     POST request itself is refused, with an HTTP 403 that OpenShell sends
+  body (OpenShell's, not httpbin's, truncated to 300 bytes):
+  {"binary":"/usr/bin/curl","detail":"POST /post not permitted by policy","error":"policy_denied","host":"httpbin.org","layer":"l7","method":"POST","next_steps":[],"path":"/post","policy":"net-test-get"
+  [REDACTED-TS] [sandbox] [OCSF] NET:OPEN [INFO] ALLOWED /usr/bin/curl([REDACTED-PID]) -> httpbin.org:443 [policy:net-test-get engine:opa]
+  [REDACTED-TS] [sandbox] [OCSF] HTTP:POST [MED] DENIED POST http://httpbin.org:443/post [policy:net-test-get engine:l7] [reason:L7_REQUEST deny POST httpbin.org:443/post reason=POST /post not permitted by policy]
+
+Control rule applied (same endpoint):
+  openshell policy update oea-net-test --add-allow 'httpbin.org:443:POST:/post' --wait
+  -> policy version 3 submitted and loaded (hash prefix a055836a2ec7)
+
+----------------------------------------------------------------------
+STAGE 2 -- GET and POST /post allowed
+Active policy: version 3, hash
+a055836a2ec7aa444b922b7e5e8fa82243130fb6ab7b5abe54be180f1217a96f
+----------------------------------------------------------------------
+TEST 3b -- the same POST as in 3a (run twice, identical)
+curl -X POST -d dummy=1 https://httpbin.org/post
+  -> HTTP_STATUS:200 CURL_EXIT:0
+  [REDACTED-TS] [sandbox] [OCSF] HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/post [policy:net-test-get engine:l7]
+POST to a path the rule does not name:
+curl -X POST -d dummy=1 https://httpbin.org/anything
+  -> HTTP_STATUS:403 CURL_EXIT:0
+  body: {"binary":"/usr/bin/curl","detail":"POST /anything not permitted by policy","error":"policy_denied","host":"httpbin.org","layer":"l7","method":"POST","next_steps":[],"path":"/anything","policy":"net-test-get"
+  [REDACTED-TS] [sandbox] [OCSF] HTTP:POST [MED] DENIED POST http://httpbin.org:443/anything [policy:net-test-get engine:l7] [reason:L7_REQUEST deny POST httpbin.org:443/anything reason=POST /anything not permitted by policy]
+
+----------------------------------------------------------------------
+Summary
+----------------------------------------------------------------------
+| request                              | policy at the time        | curl exit | HTTP status | OpenShell decision                          |
+|--------------------------------------|---------------------------|-----------|-------------|---------------------------------------------|
+| GET httpbin.org/get                  | none (v1)                 | 56        | 000         | NET:OPEN DENIED, policy:-                    |
+| GET httpbin.org/get                  | GET-only (v2)             | 0         | 200         | NET:OPEN + HTTP:GET ALLOWED, net-test-get    |
+| GET example.com/ (not in policy)     | GET-only (v2)             | 56        | 000         | NET:OPEN DENIED, policy:-, "not allowed"     |
+| POST httpbin.org/post                | GET-only (v2)             | 0         | 403         | NET:OPEN ALLOWED, HTTP:POST DENIED (l7)      |
+| POST httpbin.org/post                | GET + POST /post (v3)     | 0         | 200         | HTTP:POST ALLOWED, net-test-get              |
+| POST httpbin.org/anything            | GET + POST /post (v3)     | 0         | 403         | HTTP:POST DENIED (l7), path not in rule      |
+
+What this shows
+- An endpoint outside the policy cannot return a 200: the connection itself is
+  refused (curl exit 56, status 000), and the log names the reason.
+- With only GET allowed, the connection to the endpoint opens (NET:OPEN
+  ALLOWED) but the POST is stopped at the HTTP layer (engine:l7), returning
+  403 with an OpenShell JSON body, before it reaches httpbin.
+- The block is caused by the rule, not by the server: the same POST returns
+  200 once a POST rule exists, and a POST to a different path stays blocked.
+- Evidence for each request is OpenShell's own decision line (naming the rule
+  and the layer) plus the policy version/hash, not the HTTP status alone.
+
+Limits of this experiment (not tested, not assumed)
+- Only POST was tried against the GET-only rule, not PUT/DELETE/PATCH, and
+  not HEAD (baseline_test3 showed HEAD allowed under the 'read-only' preset).
+- What the 'read-only' preset itself allows was not tested here.
+- Rules are tied to /usr/bin/curl; another binary reaching the same endpoint
+  was not tried. Plain HTTP (non-TLS) and --add-deny rules were not tried.
+- One sandbox/container throughout, so time and the sandbox's history (Stage 0
+  was a denied first attempt) were not controlled. Each request was run twice
+  with identical results.
+- The log capture window overlapped by up to a second, so neighbouring
+  requests' lines sometimes appeared together; the lines above are those that
+  belong to each request, by method, host and path.

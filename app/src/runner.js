@@ -6,6 +6,15 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { runInWsl, scrubCredentials, redactCredentialFields } = require("./wsl");
+const {
+  MODELED_METHODS,
+  BODY_METHODS,
+  MODEL_VERIFIED_ON,
+  parseTarget,
+  evaluateNetworkPolicy,
+  parseDecisionLines,
+  composeNetworkVerdict,
+} = require("./netpolicy");
 
 const RESULTS_DIR = path.join(__dirname, "..", "results");
 
@@ -274,7 +283,7 @@ async function listDirectory(sandboxName, dirPath) {
       }
       treeContainerCache.set(sandboxName, container);
     }
-    result = await runInWsl(`docker exec -u root ${container} find ${p} -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>&1`);
+    result = await runInWsl(`docker exec -u root ${container} find ${p} -mindepth 1 -maxdepth 1 -type d -printf '%f\\0' 2>&1`);
     const containerGone = result.code !== 0 && /no such container|is not running/i.test(result.stdout + result.stderr);
     if (!containerGone) break;
     treeContainerCache.delete(sandboxName);
@@ -290,11 +299,12 @@ async function listDirectory(sandboxName, dirPath) {
       children: [],
     };
   }
+  // NUL-separated and NOT trimmed: `demo` and `demo ` (or a name containing
+  // a newline) are different folders and must stay different.
   const children = result.stdout
-    .split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .sort((a, b) => a.localeCompare(b));
+    .split("\0")
+    .filter((s) => s !== "")
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   return { ok: true, path: dirPath, canList: true, children };
 }
 
@@ -753,7 +763,7 @@ async function fileState(container, target, baselineContent) {
   });
   if (catCode !== 0) return { state: "MEASUREMENT_ERROR", detail: "read-back failed" };
   if (content === baselineContent) return { state: "UNCHANGED", content };
-  if (content.trim() === "") return { state: "EMPTIED", content };
+  if (content === "") return { state: "EMPTIED", content };
   return { state: "MODIFIED", content };
 }
 
@@ -802,7 +812,8 @@ function runAttempt(params) {
   }
   const folderPath = path.posix.normalize(params.folderPath);
   const target = auditFilePath(folderPath);
-  return withLock(`${params.sandboxName}::${folderPath}`, () => runAttemptUnlocked({ ...params, folderPath, target }));
+  const end = beginSandboxTest(params.sandboxName);
+  return withLock(`${params.sandboxName}::${folderPath}`, () => runAttemptUnlocked({ ...params, folderPath, target })).finally(end);
 }
 
 // Checks (and, if needed, performs) cleanup of exactly ONE audit file --
@@ -1070,14 +1081,29 @@ async function runAttemptUnlocked({ sandboxName, folderPath, target, operation, 
     // changes the file either way, so its own success/failure must come
     // from the exec call's exit code; everything else is judged by
     // whether the file actually changed, not by text-matching stderr.
-    const actuallyAllowed = operation === "read" ? execResult.code === 0 : after.state !== "UNCHANGED";
+    // The file must end up in the state THIS operation produces -- gone for
+    // delete, empty for truncate, our own marker text for modify. Any other
+    // change (e.g. a delete that left the file behind with different
+    // content) is not the operation succeeding, whatever the exit code.
+    const producedState = operation === "delete" ? "DELETED" : operation === "truncate" ? "EMPTIED" : operation === "modify" ? "MODIFIED" : null;
+    const effectApplied =
+      operation === "read"
+        ? null
+        : after.state === producedState && (operation !== "modify" || after.content === "DIRECT-AUDIT-WRITE\n");
+    const actuallyAllowed = operation === "read" ? execResult.code === 0 : effectApplied;
+    const strangeState = operation !== "read" && !effectApplied && after.state !== "UNCHANGED";
+    const exitDisagrees = operation !== "read" && effectApplied && execResult.code !== 0;
 
-    // A non-read op reporting success (exit 0) while the file stayed
-    // unchanged is a contradiction our own commands should never produce
-    // (echo/rm/truncate that exit 0 always touch the file) -- it means
-    // something in the test command itself is broken, not that OpenShell
-    // blocked it, so it must not be read as a block either.
-    if (operation !== "read" && !actuallyAllowed && execResult.code === 0) {
+    if (strangeState) {
+      verdict = `inconclusive: after the '${operation}' attempt the file is ${after.state}, which is not what that operation produces (exit ${execResult.code}) -- the outcome cannot be read as allowed or blocked`;
+    } else if (exitDisagrees) {
+      verdict = `inconclusive: the file ended up ${after.state} as '${operation}' would leave it, but the command exited ${execResult.code} -- the exit code and the file disagree, so the outcome is not read either way`;
+    } else if (operation !== "read" && !actuallyAllowed && execResult.code === 0) {
+      // A non-read op reporting success (exit 0) while the file stayed
+      // unchanged is a contradiction our own commands should never produce
+      // (echo/rm/truncate that exit 0 always touch the file) -- it means
+      // something in the test command itself is broken, not that OpenShell
+      // blocked it, so it must not be read as a block either.
       verdict = `inconclusive: the command reported success (exit 0) but the file was unchanged -- not evidence of a block, something in the test command itself is likely wrong`;
     } else if (!actuallyAllowed && toolNotStarted) {
       verdict = `inconclusive: the file tool itself could not be started (exit ${execResult.code}) -- the operation never reached the file, so this says nothing about OpenShell's file policy`;
@@ -1368,12 +1394,35 @@ async function inspectSandboxRuntime(sandboxName) {
 // rather than measured against a container that is about to disappear.
 const recreatesInProgress = new Set();
 
+// Tests (file attempts and network tests) running or WAITING for their
+// turn, per sandbox. Counted from the moment a test is requested, so a
+// recreate arriving while one is still queued cannot delete the sandbox
+// under it; the reverse is covered by the recreatesInProgress check.
+const activeSandboxTests = new Map();
+function beginSandboxTest(sandboxName) {
+  activeSandboxTests.set(sandboxName, (activeSandboxTests.get(sandboxName) || 0) + 1);
+  let ended = false;
+  return () => {
+    if (ended) return;
+    ended = true;
+    const n = (activeSandboxTests.get(sandboxName) || 1) - 1;
+    if (n > 0) activeSandboxTests.set(sandboxName, n);
+    else activeSandboxTests.delete(sandboxName);
+  };
+}
+
 async function createProtectedFolder(params) {
   const sandboxName = params && params.sandboxName;
   if (recreatesInProgress.has(sandboxName)) {
     return {
       ok: false,
       error: `A protected-folder change for '${sandboxName}' is already running (it deletes and recreates the sandbox). Wait for it to finish, then try again.`,
+    };
+  }
+  if (activeSandboxTests.get(sandboxName)) {
+    return {
+      ok: false,
+      error: `A test is still running (or queued) against '${sandboxName}'. Changing a protected folder deletes and recreates the sandbox, so wait for the test to finish, then try again.`,
     };
   }
   recreatesInProgress.add(sandboxName);
@@ -1499,8 +1548,13 @@ async function createProtectedFolderUnlocked({ sandboxName, folderName = "Ahmed"
   if (!NAME_RE.test(runAsUser || "") || !NAME_RE.test(runAsGroup || "")) {
     return { ok: false, error: `'${sandboxName}'s policy does not name a usable run_as_user/run_as_group. Not deleting the existing sandbox.` };
   }
+  // Checked against the IMAGE the replacement will start from (a throwaway
+  // container, no network), not the running container: an account added to
+  // the live container after it started is not in the image, and the
+  // replacement's `chown` would then fail once the original is gone.
   const idCheck = await runInWsl(
-    `docker exec -u root ${runtime.container} sh -c 'id -u "$1" >/dev/null && getent group "$2" >/dev/null' _ ${shQuote(runAsUser)} ${shQuote(runAsGroup)}`
+    `docker run --rm --network none --entrypoint sh ${shQuote(runtime.imageId)} -c 'id -u "$1" >/dev/null && getent group "$2" >/dev/null' _ ${shQuote(runAsUser)} ${shQuote(runAsGroup)}`,
+    { timeoutMs: 60_000 }
   );
   if (idCheck.code !== 0) {
     return {
@@ -1609,9 +1663,292 @@ async function recreateWithPolicy({ sandboxName, effective, folderPath, permissi
   };
 }
 
+// =======================================================================
+// Network test: one real request, from inside the sandbox, under the
+// sandbox's EXISTING network policy.
+//
+// This never writes policy. It reads the live policy (`policy get`), works
+// out what that policy says should happen to the request, runs
+// /usr/bin/curl inside the sandbox as the sandbox user through OpenShell
+// (so OpenShell's own proxy decides), reads OpenShell's decision lines from
+// its log, and compares the two. The policy's version and hash are read
+// before and after; if they differ, someone changed the policy mid-test and
+// the result is inconclusive instead of being judged against either one.
+// =======================================================================
+const NET_BINARY = "/usr/bin/curl";
+const NET_MAX_BODY = 2000;
+
+// Runs inside the sandbox. $1 is a per-request random marker, printed as a
+// line of its own so that a failure to START (gateway error, sandbox gone)
+// can be told apart from a request that ran and failed. curl is exec'd by a
+// small `sh -c` that first reports its own pid: the sandbox proxy logs the
+// connecting process as `curl(<pid>)`, and that pid is what ties OpenShell's
+// decision lines to THIS request (confirmed live: the two are the same
+// number). The response is held in a shell variable (no file: /tmp may not
+// be writable under the sandbox's policy) and NEVER printed -- a server's
+// body can contain anything, so only the status code and exit code are kept.
+const NET_SCRIPT = [
+  'M="$1"; shift',
+  'echo "$M"',
+  `if [ ! -x ${NET_BINARY} ]; then echo "$M:curl_missing"; exit 127; fi`,
+  `out=$(sh -c 'echo "__OEA_PID__$$"; exec ${NET_BINARY} -s -m 20 --max-filesize 1048576 -w "\\n__OEA_STATUS__%{http_code}" "$@"' _ "$@"); rc=$?`,
+  'code=${out##*__OEA_STATUS__}',
+  'pid=${out#__OEA_PID__}; pid=${pid%%[!0-9]*}',
+  'echo "$M:status=$code:exit=$rc:pid=$pid"',
+].join("\n");
+
+function randomNetMarker() {
+  return `OEA-NET-STARTED-${crypto.randomBytes(8).toString("hex")}`;
+}
+
+function parseNetOutput(output, marker) {
+  const lines = output.split(/\r?\n/).map((l) => l.trim());
+  const re = new RegExp(`^${marker}:status=(\\d+):exit=(\\d+):pid=(\\d*)$`);
+  let status = null;
+  let exit = null;
+  let pid = null;
+  for (const l of lines) {
+    const m = re.exec(l);
+    if (m) {
+      status = m[1];
+      exit = Number(m[2]);
+      pid = m[3] || null;
+    }
+  }
+  return {
+    started: lines.includes(marker),
+    curlMissing: lines.includes(`${marker}:curl_missing`),
+    status,
+    exit,
+    pid,
+  };
+}
+
+// Reads the sandbox's log for lines mentioning `host`. `ok` is false when
+// `openshell logs` itself failed -- distinct from succeeding and finding no
+// matching lines, which is a normal, empty result.
+async function readHostLogLines(sandboxName, host) {
+  const r = await runInWsl(
+    `logs=$(openshell logs ${shQuote(sandboxName)} -n 5000 2>&1) || { echo OEA_LOGS_FAILED; exit 3; }; printf '%s\\n' "$logs" | grep -F ${shQuote(host)}; exit 0`,
+    { timeoutMs: 30_000, label: "measure: OpenShell decision log for this destination" }
+  );
+  const text = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
+  if (r.code !== 0 || r.timedOut || text.includes("OEA_LOGS_FAILED")) return { ok: false, lines: [] };
+  return {
+    ok: true,
+    lines: text
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean),
+  };
+}
+
+// Lines in `after` that were not already in `before` (compared as a
+// multiset): independent of any clock, so nothing from earlier requests
+// can be attributed to this one.
+function newLogLines(before, after) {
+  const seen = new Map();
+  for (const l of before) seen.set(l, (seen.get(l) || 0) + 1);
+  const out = [];
+  for (const l of after) {
+    const n = seen.get(l) || 0;
+    if (n > 0) seen.set(l, n - 1);
+    else out.push(l);
+  }
+  return out;
+}
+
+function netPolicyIdentity(fetched) {
+  return { version: fetched.raw.active_version ?? fetched.raw.version ?? null, hash: fetched.raw.hash ?? null };
+}
+
+function validateNetworkRequest({ url, method, body }) {
+  const target = parseTarget(url);
+  if (!target.ok) return { ok: false, error: target.error };
+  if (!MODELED_METHODS.includes(method)) return { ok: false, error: `Method must be one of: ${MODELED_METHODS.join(", ")}.` };
+  if (body !== undefined && body !== null && body !== "") {
+    if (!BODY_METHODS.includes(method)) return { ok: false, error: `${method} requests do not send a body.` };
+    if (typeof body !== "string" || body.length > NET_MAX_BODY || body.includes("\u0000")) {
+      return { ok: false, error: `The request body must be text of at most ${NET_MAX_BODY} characters.` };
+    }
+  }
+  return { ok: true, target };
+}
+
+// What the sandbox's CURRENT policy says should happen to this request --
+// no request is sent.
+async function previewNetworkExpectation({ sandboxName, url, method }) {
+  if (!sandboxName) return { ok: false, error: "Select a sandbox first." };
+  const valid = validateNetworkRequest({ url, method });
+  if (!valid.ok) return valid;
+  const fetched = await fetchEffectivePolicy(sandboxName);
+  if (!fetched.ok) return { ok: false, error: fetched.error };
+  const { target } = valid;
+  const expected = evaluateNetworkPolicy(fetched.policy.network_policies, {
+    binary: NET_BINARY,
+    host: target.host,
+    port: target.port,
+    method,
+    path: target.path,
+    scheme: target.scheme,
+  });
+  return { ok: true, expected, policy: netPolicyIdentity(fetched), target: { host: target.host, port: target.port, path: target.path } };
+}
+
+function runNetworkTest(params) {
+  const sandboxName = params && params.sandboxName;
+  if (recreatesInProgress.has(sandboxName)) {
+    return Promise.resolve({
+      ok: false,
+      error: `'${sandboxName}' is being deleted and recreated right now (protected-folder change). Run the network test once that finishes.`,
+    });
+  }
+  const end = beginSandboxTest(sandboxName);
+  return withLock(`${sandboxName}::network`, () => runNetworkTestUnlocked(params)).finally(end);
+}
+
+async function runNetworkTestUnlocked({ sandboxName, url, method, body, versionTag }) {
+  if (!sandboxName) return { ok: false, error: "Select a sandbox first." };
+  const valid = validateNetworkRequest({ url, method, body });
+  if (!valid.ok) return valid;
+  const { target } = valid;
+  const startedAt = new Date().toISOString();
+
+  // The policy the request will be judged against. If it can't be read,
+  // there is nothing to respect -- stop instead of running unjudged.
+  const before = await fetchEffectivePolicy(sandboxName);
+  if (!before.ok) return { ok: false, error: `Could not read '${sandboxName}'s policy, so the test cannot be judged against it: ${before.error}` };
+  const policyBefore = netPolicyIdentity(before);
+  const expected = evaluateNetworkPolicy(before.policy.network_policies, {
+    binary: NET_BINARY,
+    host: target.host,
+    port: target.port,
+    method,
+    path: target.path,
+    scheme: target.scheme,
+  });
+
+  const marker = randomNetMarker();
+  // --globoff: the URL is one request, never a {a,b} / [1-9] expansion.
+  // --data-raw: the body is the text typed, never an @file reference.
+  const curlArgs =
+    method === "HEAD" ? ["--globoff", "-I", target.url] : ["--globoff", "-X", method, ...(body ? ["--data-raw", body] : []), target.url];
+  const logBefore = await readHostLogLines(sandboxName, target.host);
+  if (!logBefore.ok) {
+    return { ok: false, error: "Could not read OpenShell's log before the request, so its decision could not be attributed afterwards. Nothing was sent; try again." };
+  }
+  const exec = await runInWsl(
+    `openshell sandbox exec -n ${shQuote(sandboxName)} -- sh -c ${shQuote(NET_SCRIPT)} _ ${shQuote(marker)} ${curlArgs.map(shQuote).join(" ")} 2>&1`,
+    { timeoutMs: 60_000 }
+  );
+  const out = parseNetOutput(exec.stdout.replace(/\x1b\[[0-9;]*m/g, ""), marker);
+
+  // OpenShell's own decision for THIS request: log lines that appeared
+  // since just before it was sent. The HTTP-level line can land a moment
+  // after the connection line, so wait until two reads agree.
+  const decisionCtx = { binary: NET_BINARY, host: target.host, port: target.port, method, path: target.path, pid: out.pid };
+  let observed = parseDecisionLines([], decisionCtx);
+  let logReadFailed = false;
+  if (out.started && !out.curlMissing) {
+    let last = "";
+    for (let i = 0; i < 8; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const read = await readHostLogLines(sandboxName, target.host);
+      if (!read.ok) {
+        logReadFailed = true;
+        continue;
+      }
+      logReadFailed = false;
+      observed = parseDecisionLines(newLogLines(logBefore.lines, read.lines), decisionCtx);
+      const key = observed.lines.join("\n") + "|" + observed.pids.join(",");
+      if (observed.lines.length && key === last) break;
+      last = key;
+    }
+  }
+
+  // The test must have run under the SAME policy it was judged against.
+  const after = await fetchEffectivePolicy(sandboxName);
+  const policyAfter = after.ok ? netPolicyIdentity(after) : null;
+  const policyChanged = !policyAfter || policyAfter.version !== policyBefore.version || policyAfter.hash !== policyBefore.hash;
+
+  const curl = { status: out.status, exit: out.exit };
+  let verdict;
+  let outcome;
+  if (!out.started) {
+    outcome = "inconclusive";
+    verdict = `inconclusive: the request never started inside the sandbox (this test's own start marker never appeared -- a gateway/CLI-level issue: ${safeText(exec.stdout + exec.stderr).trim().slice(0, 300)}) -- not a result either way`;
+  } else if (out.curlMissing) {
+    outcome = "inconclusive";
+    verdict = `inconclusive: ${NET_BINARY} is not installed in '${sandboxName}' -- the test cannot run there (sandboxes created from this project's images/base include curl)`;
+  } else if (exec.timedOut) {
+    outcome = "inconclusive";
+    verdict = "inconclusive: the test command itself timed out -- not a result either way";
+  } else if (out.status === null) {
+    outcome = "inconclusive";
+    verdict = "inconclusive: the request did not report a result -- not a result either way";
+  } else if (logReadFailed) {
+    outcome = "inconclusive";
+    verdict = "inconclusive: OpenShell's log could not be read after the request, so its decision could not be attributed to it -- not a result either way";
+  } else if (policyChanged) {
+    outcome = "inconclusive";
+    verdict = policyAfter
+      ? `inconclusive: the sandbox's policy changed while the test ran (version ${policyBefore.version} -> ${policyAfter.version}, hash ${String(policyBefore.hash).slice(0, 12)} -> ${String(policyAfter.hash).slice(0, 12)}), so it cannot be judged against either`
+      : "inconclusive: the sandbox's policy could not be re-read after the test, so it cannot be confirmed to have stayed the same";
+  } else {
+    ({ verdict, outcome } = composeNetworkVerdict({ expected, observed, curl, method, target }));
+  }
+
+  const summary = [
+    `HTTP status: ${out.status ?? "-"}   curl exit: ${out.exit ?? "-"}`,
+    ...observed.lines.map((l) => `OpenShell: ${l.replace(/^\[[\d.]+\]\s*/, "")}`),
+    `Policy: version ${policyBefore.version}, hash ${String(policyBefore.hash || "").slice(0, 12)}${policyChanged ? " (CHANGED during the test)" : " (unchanged)"}`,
+  ].join("\n");
+
+  const finishedAt = new Date().toISOString();
+  const operation = `net ${method} ${target.host}:${target.port}${target.path}`;
+  const result = {
+    kind: "network",
+    versionTag: versionTag || "(unspecified)",
+    sandboxName,
+    operation,
+    startedAt,
+    finishedAt,
+    url: safeText(target.url),
+    method,
+    bodyBytes: body ? Buffer.byteLength(body) : 0,
+    binary: NET_BINARY,
+    expected,
+    observed: {
+      connection: observed.connection,
+      connectionRule: observed.connectionRule,
+      http: observed.http,
+      httpRule: observed.httpRule,
+      httpReason: observed.httpReason ? safeText(observed.httpReason) : null,
+    },
+    decisionLines: observed.lines.map((l) => safeText(l)),
+    curlExit: out.exit,
+    httpStatus: out.status,
+    policyBefore,
+    policyAfter,
+    policyChangedDuringTest: policyChanged,
+    modelVerifiedOn: MODEL_VERIFIED_ON,
+    outcome,
+    execStdout: safeText(summary),
+    execStderr: "",
+    verdict,
+  };
+  const { attemptId, file } = writeResultFile(
+    (id) => `${startedAt.replace(/[:.]/g, "-")}__${safeFileNamePart(sandboxName)}__net-${method}__${id}.json`,
+    (id) => ({ ...result, attemptId: id })
+  );
+  return { ok: true, result: { ...result, attemptId }, file };
+}
+
 module.exports = {
   listSandboxes,
   runAttempt,
+  runNetworkTest,
+  previewNetworkExpectation,
   listResults,
   createSandbox,
   getInstalledOpenShellVersion,

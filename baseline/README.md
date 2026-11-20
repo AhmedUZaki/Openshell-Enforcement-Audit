@@ -38,3 +38,9 @@ that history is left alone, not force-pushed over.
   is attributed through OpenShell's decision log naming the new rule, not
   through the HTTP result alone. Run for real against a live OpenShell
   gateway/sandbox, not simulated.
+- `baseline_test4.txt` -- per-endpoint and per-METHOD enforcement, in one
+  disposable sandbox: a GET to an allowed endpoint succeeds, a request to an
+  endpoint not in the policy cannot return a 200, and with a GET-only rule a
+  POST to the same endpoint is refused at the HTTP layer (403 from OpenShell)
+  until a POST rule is added. Run for real, not simulated; each result is
+  backed by OpenShell's decision log line and the policy version/hash.

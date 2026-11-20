@@ -31,6 +31,8 @@
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
   th { color: var(--muted); }
+  /* Network-test rows carry long OpenShell log lines; keep the output column readable. */
+  #resultsTable td:last-child { min-width: 340px; }
   .ok { color: #16a34a; }
   .bad { color: #dc2626; }
   .warn { color: #ca8a04; }
@@ -72,6 +74,8 @@
   .perm-read_only { background: #fef3c7; color: #92620a; }
   .perm-read_write { background: #dcfce7; color: #166534; }
   .perm-unknown { background: #e5e7eb; color: #4b5563; }
+  .net-allow { background: #dcfce7; color: #166534; }
+  .net-block { background: #fde2e2; color: #a3121a; }
 </style>
 </head>
 <body>
@@ -202,6 +206,40 @@
 
     <button id="runBtn">Run attempt</button>
     <div id="runStatus" class="sub"></div>
+  </fieldset>
+
+  <fieldset id="networkSection">
+    <legend>Network test</legend>
+    <div class="sub">Sends one real request from inside the selected sandbox, as the sandbox user (<code>/usr/bin/curl</code>), so OpenShell's network policy decides the outcome. It never changes the policy: the sandbox's existing rules are read, the expected result is worked out from them, and the real result is compared with it.</div>
+
+    <label>URL</label>
+    <input id="netUrl" placeholder="https://example.com/path" value="https://httpbin.org/get" />
+
+    <label>Method</label>
+    <select id="netMethod">
+      <option value="GET">GET</option>
+      <option value="HEAD">HEAD</option>
+      <option value="OPTIONS">OPTIONS</option>
+      <option value="POST">POST</option>
+      <option value="PUT">PUT</option>
+      <option value="PATCH">PATCH</option>
+      <option value="DELETE">DELETE</option>
+    </select>
+
+    <div id="netBodyRow" style="display:none;">
+      <label>Request body (sent to the real server -- dummy data only)</label>
+      <input id="netBody" value="dummy=1" />
+    </div>
+
+    <label>Expected under the sandbox's current policy (read from the live policy, nothing is sent)</label>
+    <div id="netExpectDisplay" class="sub">
+      <span class="perm-badge perm-unknown" id="netExpectBadge">Unknown</span>
+      <span id="netExpectDetail">Select a sandbox first.</span>
+    </div>
+
+    <button id="netRunBtn">Run network test</button>
+    <div id="netStatus" class="sub"></div>
+    <div class="sub">Uses the version tag chosen under "Run an attempt". The result is added to the Results table below.</div>
   </fieldset>
 
   <fieldset>
